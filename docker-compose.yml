@@ -1,0 +1,117 @@
+# TrailCam Alert — the stack a client install runs.
+#
+# This is the file install.sh downloads. It has no build sections on purpose: a
+# client machine has no source tree, and a `build:` here would turn a failed
+# pull into a baffling error about a missing directory.
+#
+# Development uses docker-compose.yml in the source repo, which builds the same
+# three images locally. Everything else about the two is identical, so a gate
+# that passes in development passes on a client machine.
+
+name: trailcam
+
+x-common-env: &common-env
+  TRAILCAM_CONFIG: /etc/trailcam/config.ini
+  TZ: ${TZ:-UTC}
+  # config.ini is 0600 (it holds this password) and the web container's PHP
+  # runs unprivileged, so the same credentials are passed here too. One
+  # source: the .env install.sh generated.
+  DB_HOST: db
+  DB_PORT_INTERNAL: 3306
+  DB_NAME: ${DB_NAME:-trailcam}
+  DB_USER: ${DB_USER:-trailcam}
+  DB_PASSWORD: ${DB_PASSWORD}
+
+services:
+  db:
+    image: mariadb:11
+    container_name: trailcam_db
+    restart: unless-stopped
+    environment:
+      MARIADB_ROOT_PASSWORD: ${DB_ROOT_PASSWORD}
+      MARIADB_DATABASE: ${DB_NAME:-trailcam}
+      MARIADB_USER: ${DB_USER:-trailcam}
+      MARIADB_PASSWORD: ${DB_PASSWORD}
+      TZ: ${TZ:-UTC}
+    volumes:
+      - db_data:/var/lib/mysql
+    ports:
+      - "127.0.0.1:${DB_PORT:-3308}:3306"
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+  watcher:
+    image: ${APP_IMAGE:-ghcr.io/riaan007/trailcam-app:latest}
+    container_name: trailcam_watcher
+    restart: unless-stopped
+    command: ["python", "-u", "watcher.py"]
+    environment: *common-env
+    volumes:
+      - ${CONFIG_FILE:-/etc/trailcam/config.ini}:/etc/trailcam/config.ini:ro
+      - ${DATA_DIR:-/srv/trailcam}:/srv/trailcam
+      - ${LOG_DIR:-/var/log/trailcam}:/var/log/trailcam
+      # The watcher writes the FTP accounts from the cameras table, so it
+      # shares the account files with the ftp container.
+      - ftp_users:/etc/trailcam-ftp
+    depends_on:
+      db:
+        condition: service_healthy
+
+  bot:
+    image: ${APP_IMAGE:-ghcr.io/riaan007/trailcam-app:latest}
+    container_name: trailcam_bot
+    restart: unless-stopped
+    command: ["python", "-u", "telegram_bot.py"]
+    environment: *common-env
+    volumes:
+      - ${CONFIG_FILE:-/etc/trailcam/config.ini}:/etc/trailcam/config.ini:ro
+      - ${DATA_DIR:-/srv/trailcam}:/srv/trailcam
+      - ${LOG_DIR:-/var/log/trailcam}:/var/log/trailcam
+    depends_on:
+      db:
+        condition: service_healthy
+
+  ftp:
+    image: ${FTP_IMAGE:-ghcr.io/riaan007/trailcam-ftp:latest}
+    container_name: trailcam_ftp
+    restart: unless-stopped
+    # Host networking: passive FTP needs the data ports reachable at the same
+    # address the control connection used, and a camera on the LAN knows
+    # nothing about docker's NAT.
+    network_mode: host
+    environment:
+      TZ: ${TZ:-UTC}
+      FTP_PORT: ${FTP_PORT:-21}
+      PASV_MIN_PORT: ${PASV_MIN_PORT:-40000}
+      PASV_MAX_PORT: ${PASV_MAX_PORT:-40100}
+      PASV_ADDRESS: ${PASV_ADDRESS:-}
+      PUID: ${PUID:-1000}
+      PGID: ${PGID:-1000}
+    volumes:
+      - ${DATA_DIR:-/srv/trailcam}:/srv/trailcam
+      - ftp_users:/etc/trailcam-ftp
+
+  web:
+    image: ${WEB_IMAGE:-ghcr.io/riaan007/trailcam-web:latest}
+    container_name: trailcam_web
+    restart: unless-stopped
+    environment: *common-env
+    volumes:
+      # Read-only: the web layer marks rows for deletion and the watcher's
+      # pruner does the unlinking, so there is one deleter and one place where
+      # path containment has to be right.
+      - ${CONFIG_FILE:-/etc/trailcam/config.ini}:/etc/trailcam/config.ini:ro
+      - ${DATA_DIR:-/srv/trailcam}:/srv/trailcam:ro
+    ports:
+      - "${WEB_PORT:-8098}:80"
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  db_data:
+  ftp_users:

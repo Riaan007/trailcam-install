@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# TrailCam Alert — the one command an operator needs.
+#
+#   trailcam status                     what is running, what has arrived
+#   trailcam add-camera shed "Shed"     new camera + FTP account + folder
+#   trailcam cameras                    list them
+#   trailcam credentials shed           what to type into the camera
+#   trailcam rotate-password shed
+#   trailcam secrets                    which credentials are set (never shown)
+#   trailcam set-secret <name> <value>
+#   trailcam settings [name=value ...]  tuning; live within ten seconds
+#   trailcam selftest [--phase N]
+#   trailcam logs [service]
+#   trailcam update                     pull new images and restart
+#   trailcam backup [dir]               database dump, photos untouched
+set -euo pipefail
+
+cd "$(dirname "$(readlink -f "$0")")"
+
+COMPOSE="docker compose"
+docker compose version >/dev/null 2>&1 || COMPOSE="docker-compose"
+
+run_app() {
+    if $COMPOSE ps --status running --services 2>/dev/null | grep -qx watcher; then
+        $COMPOSE exec -T watcher python "$@"
+    else
+        $COMPOSE run --rm --no-deps -T watcher python "$@"
+    fi
+}
+
+cmd="${1:-status}"
+[ $# -gt 0 ] && shift || true
+
+case "$cmd" in
+    status)
+        $COMPOSE ps
+        echo
+        run_app cli.py cameras
+        ;;
+    add-camera|cameras|credentials|rotate-password|enable|set-secret|secrets|settings)
+        run_app cli.py "$cmd" "$@"
+        ;;
+    selftest)
+        ./selftest.sh "$@"
+        ;;
+    logs)
+        $COMPOSE logs -f --tail=200 "${@:-}"
+        ;;
+    update)
+        $COMPOSE pull
+        $COMPOSE up -d
+        echo "Updated. Run ./selftest.sh to confirm."
+        ;;
+    backup)
+        dest="${1:-./backups}"
+        mkdir -p "$dest"
+        stamp="$(date +%Y%m%d-%H%M%S)"
+        # shellcheck disable=SC1091
+        set -a; . ./.env; set +a
+        $COMPOSE exec -T db mariadb-dump -u root -p"$DB_ROOT_PASSWORD" \
+            --single-transaction "${DB_NAME:-trailcam}" | gzip > "$dest/trailcam-$stamp.sql.gz"
+        echo "Wrote $dest/trailcam-$stamp.sql.gz"
+        echo "Photos are not in the dump — they live in /srv/trailcam/archive."
+        ;;
+    *)
+        sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
+        exit 1
+        ;;
+esac
