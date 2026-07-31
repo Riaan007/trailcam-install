@@ -220,10 +220,19 @@ say ""
 say "Pulling images"
 
 pull_one() {  # pull_one <service> <tries>
-    local svc="$1" tries="${2:-3}" n=1
+    local svc="$1" tries="${2:-3}" n=1 image
+    image="$(docker compose config --images "$svc" 2>/dev/null | head -1)"
+
     while [ "$n" -le "$tries" ]; do
         if docker compose pull "$svc" >/dev/null 2>&1; then
             ok "$svc"
+            return 0
+        fi
+        # Already on the machine is as good as pulled: covers a re-run, a site
+        # with no working registry route, and an image loaded by hand from a
+        # USB stick.
+        if [ -n "$image" ] && docker image inspect "$image" >/dev/null 2>&1; then
+            ok "$svc (already on this machine)"
             return 0
         fi
         warn "$svc pull failed (attempt $n of $tries)"
