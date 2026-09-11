@@ -88,9 +88,17 @@ fi
 if [ -f "$INSTALL_DIR/.env" ] || docker ps -q -f name=trailcam_ 2>/dev/null | grep -q .; then
     ok "TrailCam is already installed here — leaving its ports alone"
 else
-    for port in "${WEB_PORT:-8098}" 21; do
+    # The mail receiver listens on six ports as well, and 25 in particular is
+    # often taken on a box that does anything else (postfix, exim). Each one
+    # can be moved with the variable named in the message; the stack fails
+    # to start at all if any of them is busy, so this is the place to say so.
+    for pair in "WEB_PORT:${WEB_PORT:-8098}" "FTP_PORT:${FTP_PORT:-21}" \
+                "SMTP_PORT:${SMTP_PORT:-25}" "SMTPS_PORT:${SMTPS_PORT:-465}" \
+                "SUBMISSION_PORT:${SUBMISSION_PORT:-587}" "SMTP_ALT_PORT:${SMTP_ALT_PORT:-2525}" \
+                "SMTPS_ALT_PORT:${SMTPS_ALT_PORT:-2526}" "SMTPS_ALT2_PORT:${SMTPS_ALT2_PORT:-2527}"; do
+        var="${pair%%:*}"; port="${pair#*:}"
         if ss -tlnH "sport = :$port" 2>/dev/null | grep -q .; then
-            die "Port $port is already in use. Free it, or set WEB_PORT before running this."
+            die "Port $port is already in use. Free it, or set $var to another port before running this (with sudo -E)."
         fi
     done
     ok "Ports free"
@@ -183,12 +191,21 @@ DB_PORT=3308
 
 WEB_PORT=$WEB_PORT
 
-FTP_PORT=21
+FTP_PORT=${FTP_PORT:-21}
 PASV_MIN_PORT=40000
 PASV_MAX_PORT=40100
 # Set this to the address the CAMERA uses to reach this machine if it is
 # behind NAT. On a LAN, leave it blank.
 PASV_ADDRESS=
+
+# Where the mail receiver listens on this machine (cameras that email their
+# photos). Change any of these if something else has the port.
+SMTP_PORT=${SMTP_PORT:-25}
+SMTPS_PORT=${SMTPS_PORT:-465}
+SUBMISSION_PORT=${SUBMISSION_PORT:-587}
+SMTP_ALT_PORT=${SMTP_ALT_PORT:-2525}
+SMTPS_ALT_PORT=${SMTPS_ALT_PORT:-2526}
+SMTPS_ALT2_PORT=${SMTPS_ALT2_PORT:-2527}
 
 DATA_DIR=$DATA_DIR
 CONFIG_FILE=$CONFIG_DIR/config.ini

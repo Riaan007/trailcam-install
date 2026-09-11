@@ -28,7 +28,11 @@ Re-running is safe. An existing install keeps its passwords and its data.
   `read:packages` scope; the installer asks for it (nothing is echoed), logs
   Docker in once, and every later `./trailcam update` reuses that login. It is
   kept in root's Docker credential store and nowhere else.
-- Ports **8098** (web, configurable), **21** and **40000-40100** (FTP) free
+- Ports **8098** (web, configurable), **21** and **40000-40100** (FTP) free,
+  and for cameras that email their photos **25, 465, 587** and **2525-2527**
+  (each movable with `SMTP_PORT`, `SMTPS_PORT`, `SUBMISSION_PORT`,
+  `SMTP_ALT_PORT`, `SMTPS_ALT_PORT`, `SMTPS_ALT2_PORT`). The installer checks
+  and names the one to change.
 - 5 GB free to start with, and **not an SD card** — trail cameras write
   constantly and SD cards do not survive it. The installer warns if it sees one.
 

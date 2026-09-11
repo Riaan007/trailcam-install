@@ -10,9 +10,25 @@
 
 name: trailcam
 
+# Docker's json-file driver keeps everything for ever unless it is told not
+# to. util.setup_logging already rotates the file logs at 5 MB x 3, but it also
+# writes every line to stdout, and that copy grew to 3.7 MB in six hours on the
+# one live site — around 5 GB a year that nothing ever deletes, on a machine
+# whose installer refuses to start with under 5 GB free.
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 x-common-env: &common-env
   TRAILCAM_CONFIG: /etc/trailcam/config.ini
-  TZ: ${TZ:-UTC}
+  # The same default as the development file. They used to differ, and the
+  # difference was the timezone: captured_at is written by Python in the
+  # watcher while the silent-camera window is measured with MariaDB's NOW(),
+  # so two containers an hour apart put photos in the wrong day's folder and
+  # mis-label day and night. install.sh writes the real zone into .env.
+  TZ: ${TZ:-Africa/Johannesburg}
   # config.ini is 0600 (it holds this password) and the web container's PHP
   # runs unprivileged, so the same credentials are passed here too. One
   # source: the .env install.sh generated.
@@ -32,7 +48,17 @@ services:
       MARIADB_DATABASE: ${DB_NAME:-trailcam}
       MARIADB_USER: ${DB_USER:-trailcam}
       MARIADB_PASSWORD: ${DB_PASSWORD}
-      TZ: ${TZ:-UTC}
+      TZ: ${TZ:-Africa/Johannesburg}
+    logging: *logging
+    # This machine is not dedicated to trail cameras — the Pi this was written
+    # on runs twenty-odd other containers, one of which is a payroll database.
+    # Nothing here may take the box down with it, so every service gets a
+    # ceiling. These are ceilings and not reservations: only the watcher ever
+    # draws its share for minutes at a time, and it is the one held to half the
+    # cores.
+    cpus: 1.0
+    mem_limit: 1g
+    pids_limit: 256
     volumes:
       - db_data:/var/lib/mysql
     ports:
@@ -49,7 +75,29 @@ services:
     container_name: trailcam_watcher
     restart: unless-stopped
     command: ["python", "-u", "watcher.py"]
-    environment: *common-env
+    environment:
+      <<: *common-env
+      # Bounds the OpenMP pools the numeric libraries start, which otherwise
+      # size themselves from os.cpu_count() — the host's core count, which
+      # inside a container knows nothing about the quota below. onnxruntime
+      # sets its own intra-op count in detect.py and does not read this, so
+      # the cpus ceiling is what actually holds it; this stops everything
+      # else oversubscribing the same cores underneath it.
+      OMP_NUM_THREADS: ${OMP_NUM_THREADS:-3}
+    logging: *logging
+    # One core always left for the rest of the machine, and no more than that
+    # taken. Three rather than two because detect.py asks onnxruntime for
+    # os.cpu_count() - 1 threads and the profile table beside it — 158 ms a
+    # frame on fast, 1111 on maximum — was measured with exactly that many. A
+    # quota below the thread count does not make the watcher tidier, it makes
+    # every published figure a lie and maximum unusable.
+    # Docker refuses a ceiling above the host's core count outright ("range
+    # of CPUs is from 0.01 to 2.00") — the whole stack failed to start on a
+    # two-core CI runner, and a two-core client box would fail the same way.
+    # The default is right for a Pi 5; a smaller host sets WATCHER_CPUS in .env.
+    cpus: ${WATCHER_CPUS:-3.0}
+    mem_limit: 1g
+    pids_limit: 256
     volumes:
       - ${CONFIG_FILE:-/etc/trailcam/config.ini}:/etc/trailcam/config.ini:ro
       - ${DATA_DIR:-/srv/trailcam}:/srv/trailcam
@@ -67,10 +115,76 @@ services:
     restart: unless-stopped
     command: ["python", "-u", "telegram_bot.py"]
     environment: *common-env
+    logging: *logging
+    cpus: 0.5
+    mem_limit: 256m
+    pids_limit: 128
     volumes:
       - ${CONFIG_FILE:-/etc/trailcam/config.ini}:/etc/trailcam/config.ini:ro
       - ${DATA_DIR:-/srv/trailcam}:/srv/trailcam
       - ${LOG_DIR:-/var/log/trailcam}:/var/log/trailcam
+    depends_on:
+      db:
+        condition: service_healthy
+
+  # Photographs that arrive as email, for cameras that cannot speak FTP.
+  #
+  # Four ports because this class of firmware is inconsistent about which one it
+  # can manage, and a camera that cannot send is a trip to a hillside: 587 is
+  # the one to prefer, 465 is implicit TLS for firmware that offers nothing
+  # else, 25 is what a carrier's MMS-to-email gateway will use, and 2525 is the
+  # fallback for an ISP that eats the other two. Set any of them to an unused
+  # host port in .env to stop publishing it — mailin.py still listens inside.
+  #
+  # NOT host networking, unlike ftp: SMTP has no second channel to negotiate, so
+  # there is nothing here like FTP's passive-mode problem and ordinary port
+  # mapping is correct.
+  mail:
+    image: ${APP_IMAGE:-ghcr.io/riaan007/trailcam-app:latest}
+    container_name: trailcam_mail
+    restart: unless-stopped
+    command: ["python", "-u", "mailin.py"]
+    environment: *common-env
+    logging: *logging
+    cpus: 0.5
+    mem_limit: 256m
+    pids_limit: 128
+    ports:
+      - "${SMTP_PORT:-25}:25"
+      - "${SMTPS_PORT:-465}:465"
+      - "${SUBMISSION_PORT:-587}:587"
+      # Two alternates, on obscure ports, for a router that should only ever
+      # forward one thing. They are NOT interchangeable and the difference is
+      # the single most likely reason a camera fails to send:
+      #
+      #   SMTP_ALT_PORT  -> 2525, plain, with STARTTLS offered
+      #   SMTPS_ALT_PORT -> 465, encrypted from the very first byte
+      #
+      # A camera with "SSL/TLS" ticked opens with a TLS ClientHello and never
+      # speaks a word of SMTP. Pointed at the plain listener it gets a plaintext
+      # 220 greeting where it expected a ServerHello and aborts — with a vendor
+      # error code that says nothing about encryption. That is exactly what
+      # happened on this site on 2026-08-14, and the wire bytes were the only
+      # thing that identified it.
+      - "${SMTP_ALT_PORT:-2525}:2525"
+      - "${SMTPS_ALT_PORT:-2526}:465"
+      # A second TLS alternate. Whether a router forwards external P to internal
+      # P or to some other number is not something this end can see — a
+      # hairpinned test from inside can follow different rules from a genuine
+      # connection from outside, so it does not settle it either. Publishing
+      # both candidate numbers costs nothing and removes the question.
+      - "${SMTPS_ALT2_PORT:-2527}:465"
+    volumes:
+      - ${CONFIG_FILE:-/etc/trailcam/config.ini}:/etc/trailcam/config.ini:ro
+      - ${DATA_DIR:-/srv/trailcam}:/srv/trailcam
+      - ${LOG_DIR:-/var/log/trailcam}:/var/log/trailcam
+      # A real certificate, if this machine has one. Read-only, and defaulted to
+      # a directory that certainly exists so an install without one does not
+      # have docker create a stray root-owned folder to mount. With nothing
+      # useful in here mailin.py generates its own self-signed certificate,
+      # which is worth exactly as much to a camera — there is nowhere in the
+      # menu to put a CA — and less to everything else.
+      - ${TLS_DIR:-/etc/trailcam}:/etc/trailcam-tls:ro
     depends_on:
       db:
         condition: service_healthy
@@ -84,13 +198,19 @@ services:
     # nothing about docker's NAT.
     network_mode: host
     environment:
-      TZ: ${TZ:-UTC}
+      TZ: ${TZ:-Africa/Johannesburg}
       FTP_PORT: ${FTP_PORT:-21}
       PASV_MIN_PORT: ${PASV_MIN_PORT:-40000}
       PASV_MAX_PORT: ${PASV_MAX_PORT:-40100}
       PASV_ADDRESS: ${PASV_ADDRESS:-}
       PUID: ${PUID:-1000}
       PGID: ${PGID:-1000}
+    logging: *logging
+    cpus: 0.5
+    mem_limit: 256m
+    # vsftpd forks per session and max_clients is 20, so this has to be roomy
+    # enough that a camera is never refused by the pid ceiling.
+    pids_limit: 512
     volumes:
       - ${DATA_DIR:-/srv/trailcam}:/srv/trailcam
       - ftp_users:/etc/trailcam-ftp
@@ -100,6 +220,10 @@ services:
     container_name: trailcam_web
     restart: unless-stopped
     environment: *common-env
+    logging: *logging
+    cpus: 0.5
+    mem_limit: 512m
+    pids_limit: 256
     volumes:
       # Read-only: the web layer marks rows for deletion and the watcher's
       # pruner does the unlinking, so there is one deleter and one place where

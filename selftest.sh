@@ -4,8 +4,16 @@
 #
 #   ./selftest.sh --phase 1
 #   ./selftest.sh                 # everything that is switched on
+#   ./selftest.sh --send-test     # also ring the phone and call Gemini
+#   ./selftest.sh --migrate       # also apply outstanding migrations
 #
-# Exits 0 only if every check passed, so it works in cron and in CI unchanged.
+# It looks and reports; it does not change anything unless asked. This is the
+# command the documentation hands to a client at two in the morning, and it
+# used to migrate their database and ring their phone as a side effect of being
+# run.
+#
+# Exits 0 if every check passed, 1 if one failed, and 2 if it could not get far
+# enough to have an opinion — so it works in cron and in CI unchanged.
 set -euo pipefail
 
 cd "$(dirname "$(readlink -f "$0")")"

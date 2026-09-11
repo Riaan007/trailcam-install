@@ -6,13 +6,17 @@
 #   trailcam cameras                    list them
 #   trailcam credentials shed           what to type into the camera
 #   trailcam rotate-password shed
+#   trailcam telegram                   find your Telegram chat id, guided
 #   trailcam secrets                    which credentials are set (never shown)
 #   trailcam set-secret <name> <value>
 #   trailcam settings [name=value ...]  tuning; live within ten seconds
-#   trailcam selftest [--phase N]
+#   trailcam selftest [--phase N]       read-only; --send-test to ring the phone
 #   trailcam logs [service]
-#   trailcam update                     pull new images and restart
-#   trailcam backup [dir]               database dump, photos untouched
+#   trailcam version                    which images and schema are running
+#   trailcam update                     pull, verify, and roll back if it broke
+#   trailcam pin <tag|digest|latest>    hold the images at a known version
+#   trailcam backup [dir]               verified dump + config, photos untouched
+#   trailcam support-bundle [dir]       redacted tarball to send to whoever built this
 set -euo pipefail
 
 cd "$(dirname "$(readlink -f "$0")")"
@@ -20,12 +24,84 @@ cd "$(dirname "$(readlink -f "$0")")"
 COMPOSE="docker compose"
 docker compose version >/dev/null 2>&1 || COMPOSE="docker-compose"
 
+RED=$'\033[31m'; GREEN=$'\033[32m'; YELLOW=$'\033[33m'; DIM=$'\033[2m'; OFF=$'\033[0m'
+say()  { printf '%s\n' "$*"; }
+warn() { printf '%s!%s %s\n' "$YELLOW" "$OFF" "$*" >&2; }
+die()  { printf '%s✗%s %s\n' "$RED" "$OFF" "$*" >&2; exit 1; }
+
+usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"; }
+
 run_app() {
     if $COMPOSE ps --status running --services 2>/dev/null | grep -qx watcher; then
         $COMPOSE exec -T watcher python "$@"
     else
         $COMPOSE run --rm --no-deps -T watcher python "$@"
     fi
+}
+
+load_env() {
+    [ -f .env ] || die "No .env here. Run this from the install directory."
+    # shellcheck disable=SC1091
+    set -a; . ./.env; set +a
+}
+
+# The password goes through the environment, never argv: `docker compose exec`
+# proxies through the host daemon, so a -p on the command line is readable from
+# the host's process table as well as the container's.
+db_query() {  # db_query <sql>
+    $COMPOSE exec -T -e MYSQL_PWD="$DB_PASSWORD" db \
+        mariadb -N -B -u"$DB_USER" "${DB_NAME:-trailcam}" -e "$1" 2>/dev/null
+}
+
+# Which image each service is on right now, by digest rather than by tag. The
+# tag is :latest on every install, so it names nothing you can go back to; the
+# digest is what makes an update reversible.
+#
+# Read from .env rather than from `docker compose config --images <service>`,
+# which also lists the images of everything the service depends on and gives no
+# promise about the order — it answers "mariadb:11" for the watcher on this
+# machine, which would have pinned the wrong thing on a rollback.
+service_image() {
+    case "$1" in
+        watcher|bot) printf '%s\n' "${APP_IMAGE:-ghcr.io/riaan007/trailcam-app:latest}" ;;
+        web)         printf '%s\n' "${WEB_IMAGE:-ghcr.io/riaan007/trailcam-web:latest}" ;;
+        ftp)         printf '%s\n' "${FTP_IMAGE:-ghcr.io/riaan007/trailcam-ftp:latest}" ;;
+        db)          printf '%s\n' "mariadb:11" ;;
+    esac
+}
+service_digest() {
+    local ref repo
+    ref="$(service_image "$1")"
+    [ -n "$ref" ] || return 1
+    # The same image usually carries several digests — one per repository it
+    # has been tagged into. Only the one for the repository this install pulls
+    # from can be pulled again, so a local build's digest must not be handed to
+    # a rollback that then cannot fetch it.
+    repo="${ref%%@*}"; repo="${repo%:*}"
+    docker image inspect -f '{{range .RepoDigests}}{{println .}}{{end}}' "$ref" 2>/dev/null \
+        | grep "^$repo@" | head -1
+}
+
+# Rewrite one variable in .env, in place, keeping everything else.
+#
+# And in this shell too, which is not a nicety: docker compose prefers a value
+# it finds in the environment over the same name in .env, and load_env exported
+# every one of them. Without the export, a rollback rewrote .env, ran `up -d`
+# with the old exported APP_IMAGE=…:latest still winning — which now resolves
+# to the image that just failed — and reported that it had gone back.
+pin_env() {  # pin_env <VAR> <value>
+    local var="$1" value="$2"
+    if grep -qE "^$var=" .env; then
+        sed -i "s|^$var=.*|$var=$value|" .env
+    else
+        printf '%s=%s\n' "$var" "$value" >> .env
+    fi
+    export "$var=$value"
+}
+
+watcher_beat() {
+    db_query "SELECT COALESCE(UNIX_TIMESTAMP(updated_at), 0) FROM runtime
+               WHERE name = 'watcher_heartbeat'" | tr -dc '0-9'
 }
 
 cmd="${1:-status}"
@@ -37,33 +113,287 @@ case "$cmd" in
         echo
         run_app cli.py cameras
         ;;
-    add-camera|cameras|credentials|rotate-password|enable|set-secret|secrets|settings)
+    add-camera|cameras|credentials|rotate-password|enable|set-secret|secrets|settings|telegram|reindex|manifest)
         run_app cli.py "$cmd" "$@"
         ;;
     selftest)
         ./selftest.sh "$@"
         ;;
     logs)
-        $COMPOSE logs -f --tail=200 "${@:-}"
+        # "${@:-}" expands to one empty argument rather than to nothing, so
+        # `trailcam logs` with no service asked docker for the logs of a
+        # service named "" and printed nothing at all, exit code 0 — during
+        # the one incident where somebody needs the logs.
+        $COMPOSE logs -f --tail=200 "$@"
+        ;;
+    version)
+        load_env
+        for svc in watcher web ftp; do
+            ref="$(service_image "$svc")"
+            digest="$(service_digest "$svc" || true)"
+            printf '  %-8s %s\n' "$svc" "${ref:-unknown}"
+            if [ -n "$digest" ]; then
+                printf '  %-8s %s%s%s\n' "" "$DIM" "$digest" "$OFF"
+            fi
+        done
+        say ""
+        say "  schema   $(db_query 'SELECT value FROM runtime WHERE name = "schema_version"' || echo unknown)"
+        ;;
+    pin)
+        load_env
+        [ $# -ge 1 ] || die "Which version? A tag (latest), or a full image@sha256:… reference."
+        want="$1"
+        for pair in "watcher APP_IMAGE" "web WEB_IMAGE" "ftp FTP_IMAGE"; do
+            set -- $pair
+            case "$want" in
+                *@sha256:*|*/*)
+                    # A full reference only makes sense for one service, so
+                    # pin whichever variable its repository name matches.
+                    case "$want" in *"$(service_image "$1" | sed 's|[:@].*||')"*) pin_env "$2" "$want" ;; esac
+                    ;;
+                *)
+                    pin_env "$2" "$(service_image "$1" | sed 's|[:@].*||'):$want"
+                    ;;
+            esac
+        done
+        say "Pinned. Apply it with: ./trailcam update"
         ;;
     update)
-        $COMPOSE pull
-        $COMPOSE up -d
-        echo "Updated. Run ./selftest.sh to confirm."
+        load_env
+
+        # An update used to be `pull && up -d` followed by the word "Updated",
+        # printed whether or not anything came up. Migrations run unattended
+        # inside the new watcher and some of them rewrite data, so the order
+        # here matters: take a backup that has been checked, remember exactly
+        # what was running, and put it back if the new one cannot prove itself.
+        say "Backing up first"
+        "$0" backup >/dev/null || die "Backup failed — not updating. Fix that first."
+
+        declare -A WAS
+        for pair in "watcher APP_IMAGE" "web WEB_IMAGE" "ftp FTP_IMAGE"; do
+            set -- $pair
+            WAS[$2]="$(service_digest "$1" || true)"
+        done
+        before_beat="$(watcher_beat || echo 0)"
+
+        say "Pulling"
+        $COMPOSE pull || die "Pull failed. Nothing has changed."
+        $COMPOSE up -d || die "The new images did not start. Roll back with: ./trailcam pin <digest>"
+
+        # A container that starts and dies still leaves `up -d` reporting
+        # success, so the proof is the watcher's heartbeat moving on and the
+        # read-only gate passing — the two things that say photos are being
+        # ingested and the schema is the one this build expects.
+        say "Waiting for the watcher to report in"
+        ok=0
+        for _ in $(seq 1 60); do
+            now_beat="$(watcher_beat || echo 0)"
+            if [ -n "$now_beat" ] && [ "${now_beat:-0}" -gt "${before_beat:-0}" ]; then ok=1; break; fi
+            printf '.'
+            sleep 5
+        done
+        printf '\n'
+
+        if [ "$ok" -eq 1 ] && ./selftest.sh --phase 0; then
+            say "${GREEN}Updated.${OFF} ./trailcam version says what is running now."
+            exit 0
+        fi
+
+        warn "The new version did not come up cleanly — going back to the previous one."
+        rolled=0
+        for var in APP_IMAGE WEB_IMAGE FTP_IMAGE; do
+            if [ -n "${WAS[$var]:-}" ]; then
+                pin_env "$var" "${WAS[$var]}"
+                rolled=1
+            fi
+        done
+        if [ "$rolled" -eq 0 ]; then
+            die "No previous digests were recorded, so there is nothing to go back to.
+   The backup is in ${DATA_DIR:-.}/backups. Send: ./trailcam support-bundle"
+        fi
+        $COMPOSE up -d || die "The rollback did not start either. Send: ./trailcam support-bundle"
+        warn "Back on the previous images, which are now pinned by digest in .env."
+        warn "Nothing will update until you run: ./trailcam pin latest"
+        exit 1
         ;;
     backup)
-        dest="${1:-./backups}"
+        load_env
+        # Under DATA_DIR rather than under the install directory. On a
+        # single-disk Pi that changes nothing, but an operator who moved the
+        # photos to an external SSD gets their backups off the boot disk for
+        # free, which is the disk that fails.
+        dest="${1:-${DATA_DIR:-.}/backups}"
         mkdir -p "$dest"
         stamp="$(date +%Y%m%d-%H%M%S)"
-        # shellcheck disable=SC1091
-        set -a; . ./.env; set +a
-        $COMPOSE exec -T db mariadb-dump -u root -p"$DB_ROOT_PASSWORD" \
-            --single-transaction "${DB_NAME:-trailcam}" | gzip > "$dest/trailcam-$stamp.sql.gz"
-        echo "Wrote $dest/trailcam-$stamp.sql.gz"
-        echo "Photos are not in the dump — they live in /srv/trailcam/archive."
+        base="$dest/trailcam-$stamp"
+
+        # Into a part file first. The shell creates the .gz the moment the
+        # redirection is set up, so a dump that died halfway — wrong password,
+        # database container down — used to leave a plausible-looking archive
+        # for a later "restore the newest backup" to find.
+        $COMPOSE exec -T -e MYSQL_PWD="$DB_ROOT_PASSWORD" db \
+            mariadb-dump -u root --single-transaction --databases "${DB_NAME:-trailcam}" \
+            | gzip > "$base.sql.gz.part" || true
+
+        gzip -t "$base.sql.gz.part" 2>/dev/null \
+            || { rm -f "$base.sql.gz.part"; die "The dump is not a valid gzip stream."; }
+        # mariadb-dump signs off with this line. Its absence means the stream
+        # was cut, which gzip -t alone cannot tell you.
+        gzip -dc "$base.sql.gz.part" | tail -5 | grep -q -- "-- Dump completed" \
+            || { rm -f "$base.sql.gz.part"; die "The dump is truncated — no completion marker."; }
+        mv "$base.sql.gz.part" "$base.sql.gz"
+        # The dump contains the secrets table, so it is as sensitive as the
+        # config file beside it.
+        chmod 600 "$base.sql.gz"
+
+        # The dump alone cannot be restored. DB_PASSWORD lives in .env and in
+        # config.ini and nowhere else, so a surviving database volume with no
+        # copy of these two files is a database nobody can open.
+        cfg_file="${CONFIG_FILE:-/etc/trailcam/config.ini}"
+        if tar -czf "$base.config.tar.gz.part" \
+                -C / "${cfg_file#/}" -C "$PWD" .env 2>/dev/null; then
+            mv "$base.config.tar.gz.part" "$base.config.tar.gz"
+            chmod 600 "$base.config.tar.gz"
+        else
+            rm -f "$base.config.tar.gz.part"
+            warn "Could not read $cfg_file (it is 0600) — run this with sudo to include it."
+        fi
+
+        # Plain JSON beside the dump: what this site was, how many cameras,
+        # which schema. Readable at two in the morning without a database to
+        # load the dump into first.
+        if run_app cli.py manifest > "$base.manifest.json.part" 2>/dev/null \
+                && [ -s "$base.manifest.json.part" ]; then
+            mv "$base.manifest.json.part" "$base.manifest.json"
+        else
+            rm -f "$base.manifest.json.part"
+            warn "Could not write the manifest — is the watcher up, and new enough to have it?"
+        fi
+
+        # Fourteen generations. A backup that runs daily and never deletes
+        # anything eventually fills the disk it was meant to protect, and this
+        # one runs from cron and from every update.
+        keep=14
+        ls -1t "$dest"/trailcam-*.sql.gz 2>/dev/null | tail -n "+$((keep + 1))" \
+            | while IFS= read -r old; do
+                  rm -f "$old" "${old%.sql.gz}.config.tar.gz" \
+                        "${old%.sql.gz}.manifest.json"
+              done
+
+        say "Wrote $base.sql.gz ($(du -h "$base.sql.gz" | cut -f1))"
+        [ -f "$base.config.tar.gz" ] && say "Wrote $base.config.tar.gz (passwords — keep it as safe as the machine)"
+        say "Photos are not in the dump — they live in ${DATA_DIR:-/srv/trailcam}/archive."
+        ;;
+    support-bundle)
+        load_env
+        dest="${1:-.}"
+        mkdir -p "$dest"
+        stamp="$(date +%Y%m%d-%H%M%S)"
+        work="$(mktemp -d)"
+        trap 'rm -rf "$work"' EXIT
+        out="$work/trailcam-support-$stamp"
+        mkdir -p "$out"
+
+        # Redaction is the point of this command, not a courtesy: the whole
+        # reason there is no "just send me your logs" today is that the logs
+        # carry bot tokens and the database carries a map of where a property
+        # is watched from. Every value below is turned into a sed program and
+        # every file in the bundle goes through it.
+        redactor="$work/redact.sed"
+        esc_re() { sed -e 's/[][\.^$*+?(){}|/\\&]/\\&/g'; }
+        {
+            {
+                # Only the variables that are actually secret. Redacting every
+                # value in .env also redacted DB_NAME, and "trailcam" appears
+                # in every container name, every image and every log line — a
+                # bundle nobody could read is no more use than no bundle.
+                # grep exits 1 when it matches nothing, and with pipefail that
+                # would abort the whole command — on the one .env that has no
+                # secrets in it, at the moment somebody is trying to get help.
+                { grep -E '^[A-Z_]*(PASSWORD|TOKEN|SECRET|KEY)=.+' .env || true; } | cut -d= -f2-
+                db_query "SELECT value FROM secrets WHERE value <> ''" || true
+                # One value per row. Concatenating them was worse than useless:
+                # batch mode escapes the newlines, so the whole set arrived as
+                # a single string that matched nothing and the camera names
+                # went out in the logs.
+                db_query "SELECT name FROM cameras
+                    UNION ALL SELECT place_note FROM cameras
+                    UNION ALL SELECT latitude FROM cameras
+                    UNION ALL SELECT longitude FROM cameras" || true
+            } | tr -d '\r' | awk 'length($0) >= 6' \
+              | awk '{ print length, $0 }' | sort -rn | cut -d' ' -f2- | uniq \
+              | while IFS= read -r value; do
+                    printf 's|%s|[redacted]|g\n' "$(printf '%s' "$value" | esc_re)"
+                done
+            # Belt and braces for anything the two queries above cannot know
+            # about: a token in an old log line, a coordinate from a camera
+            # that has since been deleted.
+            printf '%s\n' \
+                's/[0-9]{8,10}:[A-Za-z0-9_-]{30,}/[redacted-token]/g' \
+                's/-?[0-9]{2,3}\.[0-9]{4,}/[redacted-coord]/g' \
+                's/([Pp]assword|[Tt]oken|[Aa]pi[_-]?[Kk]ey|[Ss]ecret)([=:] ?)[^ ",;]+/\1\2[redacted]/g'
+        } > "$redactor"
+        scrub() { sed -E -f "$redactor"; }
+
+        {
+            echo "TrailCam Alert support bundle"
+            echo "taken   $(date -Is)"
+            echo "host    $(uname -srm)"
+            echo
+            echo "== containers"
+            $COMPOSE ps 2>&1
+            echo
+            echo "== images"
+            for svc in watcher bot web ftp db; do
+                printf '%-8s %s  %s\n' "$svc" "$(service_image "$svc")" \
+                    "$(service_digest "$svc" || echo 'no digest — built locally')"
+            done
+            echo
+            echo "== disk"
+            df -h "${DATA_DIR:-/srv/trailcam}" / 2>&1
+            echo
+            echo "== runtime"
+            # Not the whole table. It holds one row per described event, which
+            # is hundreds of lines of nothing anybody reading this needs, and
+            # two rows of Telegram bookkeeping — the bot's own name and every
+            # chat it has seen, titles and all — which are the client's and not
+            # the builder's. Values are clipped because gemini_state carries a
+            # whole API error document.
+            db_query "SELECT name, LEFT(value, 120), updated_at FROM runtime
+                       WHERE name NOT LIKE 'describe\_%'
+                         AND name NOT IN ('bot_identity', 'discovered_chats')
+                       ORDER BY name" \
+                || echo "database unreachable"
+            echo
+            echo "== rows"
+            db_query "SELECT 'cameras', COUNT(*) FROM cameras
+                UNION ALL SELECT 'images', COUNT(*) FROM images
+                UNION ALL SELECT 'events', COUNT(*) FROM events
+                UNION ALL SELECT 'undelivered', COUNT(*) FROM events WHERE notified_at IS NULL
+                UNION ALL SELECT 'gave up', COUNT(*) FROM events WHERE notify_failed = 1" || true
+            echo
+            echo "== alerts by channel"
+            db_query "SELECT channel, kind, ok, COUNT(*), MAX(created_at)
+                        FROM alert_log GROUP BY channel, kind, ok ORDER BY channel" || true
+            echo
+            echo "== cameras (slugs only — names and positions stay on site)"
+            db_query "SELECT slug, enabled, kind, last_seen_at,
+                             (SELECT COUNT(*) FROM images i WHERE i.camera_id = c.id)
+                        FROM cameras c ORDER BY id" || true
+        } 2>&1 | scrub > "$out/overview.txt"
+
+        for svc in watcher bot web ftp db; do
+            $COMPOSE logs --no-color --tail=500 "$svc" 2>&1 | scrub > "$out/log-$svc.txt" || true
+        done
+
+        bundle="$dest/trailcam-support-$stamp.tar.gz"
+        tar -czf "$bundle" -C "$work" "trailcam-support-$stamp"
+        say "Wrote $bundle"
+        say "${DIM}Tokens, passwords, camera names and coordinates are stripped."
+        say "Read it before sending if you want to be sure — it is plain text.${OFF}"
         ;;
     *)
-        sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
+        usage
         exit 1
         ;;
 esac
