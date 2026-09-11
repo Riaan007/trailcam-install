@@ -23,6 +23,11 @@ Re-running is safe. An existing install keeps its passwords and its data.
 
 - 64-bit Linux on arm64 or amd64
 - Docker (installed for you if absent)
+- **An access token for the image registry.** The images are private, on
+  purpose. Ask the person who runs them for a GitHub token with the
+  `read:packages` scope; the installer asks for it (nothing is echoed), logs
+  Docker in once, and every later `./trailcam update` reuses that login. It is
+  kept in root's Docker credential store and nowhere else.
 - Ports **8098** (web, configurable), **21** and **40000-40100** (FTP) free
 - 5 GB free to start with, and **not an SD card** — trail cameras write
   constantly and SD cards do not survive it. The installer warns if it sees one.
@@ -35,6 +40,15 @@ WEB_PORT=9000 TRAILCAM_DATA=/mnt/ssd/trailcam \
 ```
 
 `sudo -E` matters — without it the environment does not survive.
+
+To install unattended, hand the registry token over the same way instead of
+being asked for it (`GHCR_USER` is the token owner's GitHub username and
+defaults to the image owner's):
+
+```bash
+GHCR_TOKEN=ghp_xxxxxxxx \
+  curl -fsSL https://raw.githubusercontent.com/Riaan007/trailcam-install/main/install.sh | sudo -E bash
+```
 
 ## Afterwards
 
